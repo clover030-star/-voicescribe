@@ -1,0 +1,307 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="apple-mobile-web-app-title" content="音声メモ">
+<meta name="theme-color" content="#4a90e2">
+<title>音声文字起こし</title>
+<link rel="manifest" href="manifest.json">
+<link rel="apple-touch-icon" href="icon.png">
+<link href="https://fonts.googleapis.com/css2?family=Noto+Sans+JP:wght@400;700&display=swap" rel="stylesheet">
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
+  body {
+    font-family: 'Noto Sans JP', sans-serif;
+    background: #f2f4f8;
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 40px 20px 60px;
+  }
+  h1 { font-size: 1.3rem; color: #333; margin-bottom: 8px; font-weight: 700; }
+  .version { font-size: 0.7rem; color: #aaa; margin-bottom: 28px; }
+
+  .mic-btn {
+    width: 88px; height: 88px;
+    border-radius: 50%; border: none;
+    background: #4a90e2; color: white;
+    font-size: 2.2rem; cursor: pointer;
+    margin-bottom: 14px;
+    display: flex; align-items: center; justify-content: center;
+    transition: background 0.2s, transform 0.1s;
+    user-select: none; -webkit-user-select: none;
+  }
+  .mic-btn:disabled { background: #ccc; cursor: not-allowed; }
+  .mic-btn:not(:disabled):active { transform: scale(0.93); }
+  .mic-btn.recording {
+    background: #e24a4a;
+    animation: pulse 1.3s ease-in-out infinite;
+  }
+  @keyframes pulse {
+    0%,100% { box-shadow: 0 0 0 0 rgba(226,74,74,0.45); }
+    50%      { box-shadow: 0 0 0 18px rgba(226,74,74,0); }
+  }
+
+  .status {
+    font-size: 0.83rem; color: #888;
+    margin-bottom: 24px; min-height: 44px;
+    text-align: center; padding: 0 12px;
+    line-height: 1.6; max-width: 480px;
+    white-space: pre-wrap;
+  }
+  .status.recording { color: #e24a4a; font-weight: bold; }
+  .status.error     { color: #c0392b; }
+
+  .transcript-box {
+    width: 100%; max-width: 680px;
+    background: white; border: 1px solid #dde1e9;
+    border-radius: 14px; min-height: 200px; max-height: 45vh;
+    overflow-y: auto; padding: 18px 20px;
+    font-size: 1.05rem; line-height: 1.85; color: #222;
+    margin-bottom: 16px; white-space: pre-wrap;
+    word-break: break-word;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.04);
+  }
+  .interim     { color: #b0b8c8; }
+  .placeholder { color: #c0c8d8; font-size: 0.9rem; }
+
+  .btn-row { display: flex; gap: 12px; width: 100%; max-width: 680px; margin-bottom: 20px; }
+  .btn {
+    flex: 1; padding: 13px 0; border-radius: 10px;
+    border: 1px solid #dde1e9; background: white;
+    color: #555; font-size: 0.95rem;
+    font-family: 'Noto Sans JP', sans-serif;
+    cursor: pointer; transition: all 0.15s;
+    box-shadow: 0 1px 4px rgba(0,0,0,0.05);
+  }
+  .btn:active { transform: scale(0.97); background: #f5f7fb; }
+
+  .debug {
+    width: 100%; max-width: 680px;
+    background: #1e1e2e; color: #a0e0a0;
+    border-radius: 10px; padding: 14px 16px;
+    font-family: monospace; font-size: 0.72rem;
+    line-height: 1.8; max-height: 180px; overflow-y: auto;
+  }
+  .debug-title { color: #555; margin-bottom: 6px; font-size: 0.68rem; }
+  .log-err  { color: #ff8080; }
+  .log-ok   { color: #80ff80; }
+  .log-info { color: #80c0ff; }
+</style>
+</head>
+<body>
+
+<h1>🎤 音声文字起こし</h1>
+<div class="version">v3 - 2024</div>
+
+<button class="mic-btn" id="micBtn" onclick="toggleRecording()">🎤</button>
+<div class="status" id="status">タップして録音開始</div>
+
+<div class="transcript-box" id="transcriptBox">
+  <span class="placeholder" id="placeholder">ここに文字起こしが表示されます</span>
+</div>
+
+<div class="btn-row">
+  <button class="btn" onclick="copyText()">📋 コピー</button>
+  <button class="btn" onclick="clearText()">🗑 クリア</button>
+</div>
+
+<div class="debug">
+  <div class="debug-title">🔍 ログ</div>
+  <div id="dbgLog"></div>
+</div>
+
+<script>
+  // Service Workerを全て登録解除してキャッシュを消す
+  if ('serviceWorker' in navigator) {
+    navigator.serviceWorker.getRegistrations().then(regs => {
+      regs.forEach(r => r.unregister());
+    });
+    caches.keys().then(keys => keys.forEach(k => caches.delete(k)));
+  }
+
+  const SpeechRec   = window.SpeechRecognition || window.webkitSpeechRecognition;
+  const micBtn      = document.getElementById('micBtn');
+  const statusEl    = document.getElementById('status');
+  const box         = document.getElementById('transcriptBox');
+  const placeholder = document.getElementById('placeholder');
+  const dbgLog      = document.getElementById('dbgLog');
+
+  const isIOS = /iphone|ipad|ipod/i.test(navigator.userAgent)
+    || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+
+  function log(msg, type) {
+    const d = document.createElement('div');
+    d.className = type === 'err' ? 'log-err' : type === 'ok' ? 'log-ok' : 'log-info';
+    d.textContent = new Date().toLocaleTimeString() + ' ' + msg;
+    dbgLog.appendChild(d);
+    dbgLog.scrollTop = dbgLog.scrollHeight;
+  }
+
+  log('v3起動 / iOS=' + isIOS + ' / API=' + (SpeechRec ? 'OK' : 'NG'), SpeechRec ? 'ok' : 'err');
+  log('URL: ' + location.hostname, 'info');
+
+  let recognition  = null;
+  let isRecording  = false;
+  let finalText    = '';
+  let restartTimer = null;
+
+  if (!SpeechRec) {
+    setStatus('このブラウザは非対応です。\niOS は Safari、PC は Chrome/Edge を使ってください。', 'error');
+    micBtn.disabled = true;
+  }
+
+  function setStatus(msg, type) {
+    statusEl.textContent = msg;
+    statusEl.className = 'status ' + (type || '');
+  }
+
+  function toggleRecording() {
+    isRecording ? stopRec() : startRec();
+  }
+
+  function createRec() {
+    const r = new SpeechRec();
+    r.lang           = 'ja-JP';
+    r.continuous     = !isIOS;
+    r.interimResults = !isIOS;
+
+    r.onstart = () => log('onstart ✅', 'ok');
+
+    r.onresult = (e) => {
+      let interim = '';
+      for (let i = e.resultIndex; i < e.results.length; i++) {
+        const result = e.results[i];
+        const text = result[0].transcript;
+        log('result: final=' + result.isFinal + ' text=' + text, 'ok');
+        if (result.isFinal) {
+          finalText += text;
+        } else {
+          interim += text;
+        }
+      }
+      render(interim);
+    };
+
+    r.onerror = (e) => {
+      const code = e && e.error ? String(e.error) : 'unknown';
+      log('onerror: ' + code, 'err');
+      if (!isRecording) return;
+      if (code === 'not-allowed') {
+        setStatus('マイクの許可が必要です。', 'error');
+        forceStop(); return;
+      }
+      if (code === 'no-speech' || code === 'aborted') {
+        scheduleRestart(300); return;
+      }
+      scheduleRestart(500);
+    };
+
+    r.onend = () => {
+      log('onend (isRecording=' + isRecording + ')', 'info');
+      if (!isRecording) return;
+      scheduleRestart(isIOS ? 300 : 100);
+    };
+
+    return r;
+  }
+
+  function scheduleRestart(delay) {
+    clearTimeout(restartTimer);
+    restartTimer = setTimeout(() => {
+      if (!isRecording) return;
+      try {
+        recognition = createRec();
+        recognition.start();
+        log('再起動', 'info');
+      } catch(e) {
+        log('再起動エラー: ' + String(e), 'err');
+      }
+    }, delay || 150);
+  }
+
+  function startRec() {
+    isRecording = true;
+    micBtn.classList.add('recording');
+    micBtn.textContent = '⏹';
+    setStatus('録音中… タップで停止', 'recording');
+    placeholder.style.display = 'none';
+    log('start()', 'info');
+    try {
+      recognition = createRec();
+      recognition.start();
+    } catch(e) {
+      log('startエラー: ' + String(e), 'err');
+      setStatus('起動エラー: ' + String(e), 'error');
+      forceStop();
+    }
+  }
+
+  function stopRec() {
+    isRecording = false;
+    clearTimeout(restartTimer);
+    if (recognition) { try { recognition.stop(); } catch(e) {} }
+    micBtn.classList.remove('recording');
+    micBtn.textContent = '🎤';
+    setStatus('タップして録音開始');
+    log('停止', 'info');
+  }
+
+  function forceStop() {
+    isRecording = false;
+    clearTimeout(restartTimer);
+    if (recognition) { try { recognition.abort(); } catch(e) {} }
+    micBtn.classList.remove('recording');
+    micBtn.textContent = '🎤';
+  }
+
+  function render(interim) {
+    box.innerHTML = '';
+    if (!finalText && !interim) {
+      box.appendChild(placeholder);
+      placeholder.style.display = '';
+      return;
+    }
+    box.appendChild(document.createTextNode(finalText));
+    if (interim) {
+      const span = document.createElement('span');
+      span.className = 'interim';
+      span.textContent = interim;
+      box.appendChild(span);
+    }
+    box.scrollTop = box.scrollHeight;
+  }
+
+  function copyText() {
+    if (!finalText.trim()) { alert('テキストがありません'); return; }
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(finalText)
+        .then(() => alert('コピーしました ✓'))
+        .catch(() => fallbackCopy());
+    } else { fallbackCopy(); }
+  }
+
+  function fallbackCopy() {
+    const ta = document.createElement('textarea');
+    ta.value = finalText;
+    ta.style.cssText = 'position:fixed;opacity:0;top:0;left:0';
+    document.body.appendChild(ta);
+    ta.focus(); ta.select();
+    try { document.execCommand('copy'); alert('コピーしました ✓'); }
+    catch(e) { alert('コピーに失敗しました'); }
+    document.body.removeChild(ta);
+  }
+
+  function clearText() {
+    finalText = '';
+    box.innerHTML = '';
+    box.appendChild(placeholder);
+    placeholder.style.display = '';
+  }
+</script>
+</body>
+</html>
